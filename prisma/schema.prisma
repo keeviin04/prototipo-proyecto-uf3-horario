@@ -1,0 +1,258 @@
+// =============================================================
+//  Horarios UF3 - Esquema de base de datos
+//  ORM: Prisma
+//  Motor: SQLite (desarrollo) / PostgreSQL (producción)
+//
+//  Notas de diseño:
+//  - Multi-centro desde el día uno (preparado para crecer).
+//  - Asignaciones de duración libre (no se obligan franjas fijas).
+//  - 3 tipos de solapamiento: profesor, aula y grupo.
+//  - Soft-archive: las entidades operativas tienen "activo" en lugar
+//    de borrarse para preservar histórico de asignaciones.
+//  - vigenteDesde / vigenteHasta opcionales en Asignacion permiten
+//    horarios por cuatrimestre o periodos parciales.
+//
+//  IMPORTANTE - Enums:
+//  SQLite no soporta enums nativos en Prisma, por lo que los
+//  modelamos como String. La validación se hace en la capa de
+//  aplicación con Zod (ver src/lib/enums.ts).
+//  Si en el futuro se migra a PostgreSQL, se pueden convertir a
+//  enums nativos sin perder datos (los valores son los mismos).
+// =============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -------------------------------------------------------------
+//  Valores válidos para los campos "tipo enum"
+//  (definidos en src/lib/enums.ts y validados con Zod)
+//
+//  Rol:            ADMIN | EDITOR | VIEWER
+//  DiaSemana:      LUNES | MARTES | MIERCOLES | JUEVES | VIERNES | SABADO | DOMINGO
+//  NivelEducativo: INFANTIL | PRIMARIA | ESO | BACHILLERATO |
+//                  FP_BASICA | FP_MEDIO | FP_SUPERIOR | GRADO | MASTER | OTRO
+//  TipoAsignatura: ASIGNATURA | TUTORIA | REUNION | GUARDIA | TAREA | OTRO
+// -------------------------------------------------------------
+
+// -------------------------------------------------------------
+//  CENTROS
+// -------------------------------------------------------------
+
+model Centro {
+  id        String   @id @default(cuid())
+  codigo    String   @unique
+  nombre    String
+  direccion String?
+  activo    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profesores   Profesor[]
+  aulas        Aula[]
+  asignaturas  Asignatura[]
+  grupos       Grupo[]
+  franjas      FranjaHoraria[]
+  asignaciones Asignacion[]
+  usuarios     Usuario[]
+
+  @@index([activo])
+}
+
+// -------------------------------------------------------------
+//  USUARIOS  (cuentas de acceso a la aplicación)
+// -------------------------------------------------------------
+
+model Usuario {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  nombre       String
+  rol          String   @default("VIEWER")  // ADMIN | EDITOR | VIEWER
+  activo       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Un usuario puede estar asociado a un centro por defecto.
+  // Si es null, se trata de un usuario global (típicamente ADMIN).
+  centroId String?
+  centro   Centro? @relation(fields: [centroId], references: [id], onDelete: SetNull)
+
+  // Relación 1:1 opcional con Profesor (si la cuenta es de un profe).
+  profesor Profesor?
+
+  // Asignaciones creadas por este usuario (trazabilidad).
+  asignacionesCreadas Asignacion[] @relation("AsignacionCreador")
+
+  @@index([email])
+  @@index([centroId])
+}
+
+// -------------------------------------------------------------
+//  PROFESORES
+// -------------------------------------------------------------
+
+model Profesor {
+  id           String   @id @default(cuid())
+  codigo       String   @unique
+  nombre       String
+  apellidos    String
+  email        String?  @unique
+  departamento String?
+  activo       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  centroId String
+  centro   Centro @relation(fields: [centroId], references: [id], onDelete: Restrict)
+
+  // Relación 1:1 opcional con Usuario.
+  usuarioId String?  @unique
+  usuario   Usuario? @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+
+  asignaciones Asignacion[]
+
+  @@index([centroId, activo])
+  @@index([apellidos, nombre])
+}
+
+// -------------------------------------------------------------
+//  AULAS
+// -------------------------------------------------------------
+
+model Aula {
+  id           String   @id @default(cuid())
+  codigo       String
+  nombre       String
+  ubicacion    String?
+  capacidad    Int?
+  equipamiento String?
+  activo       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  centroId String
+  centro   Centro @relation(fields: [centroId], references: [id], onDelete: Restrict)
+
+  asignaciones Asignacion[]
+
+  // El código de aula es único dentro de un mismo centro.
+  @@unique([centroId, codigo])
+  @@index([centroId, activo])
+}
+
+// -------------------------------------------------------------
+//  ASIGNATURAS / TAREAS
+// -------------------------------------------------------------
+
+model Asignatura {
+  id          String   @id @default(cuid())
+  codigo      String
+  nombre      String
+  descripcion String?
+  tipo        String   @default("ASIGNATURA") // ASIGNATURA | TUTORIA | REUNION | GUARDIA | TAREA | OTRO
+  color       String   @default("#3b82f6")    // Hex para identificación visual
+  activo      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  centroId String
+  centro   Centro @relation(fields: [centroId], references: [id], onDelete: Restrict)
+
+  asignaciones Asignacion[]
+
+  @@unique([centroId, codigo])
+  @@index([centroId, activo])
+}
+
+// -------------------------------------------------------------
+//  GRUPOS  (clase concreta de alumnos: 1º DAW, 2º Bach A, …)
+// -------------------------------------------------------------
+
+model Grupo {
+  id              String   @id @default(cuid())
+  codigo          String
+  nombre          String
+  nivel           String   // INFANTIL | PRIMARIA | ESO | BACHILLERATO | FP_BASICA | FP_MEDIO | FP_SUPERIOR | GRADO | MASTER | OTRO
+  cursoAcademico  String
+  numAlumnos      Int?
+  activo          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  centroId String
+  centro   Centro @relation(fields: [centroId], references: [id], onDelete: Restrict)
+
+  asignaciones Asignacion[]
+
+  @@unique([centroId, codigo, cursoAcademico])
+  @@index([centroId, activo])
+  @@index([nivel])
+}
+
+// -------------------------------------------------------------
+//  FRANJAS HORARIAS  (plantillas opcionales)
+// -------------------------------------------------------------
+
+model FranjaHoraria {
+  id          String   @id @default(cuid())
+  nombre      String   // "1ª hora", "Recreo", "2ª hora"…
+  horaInicio  String   // Formato "HH:MM" (24h)
+  horaFin     String   // Formato "HH:MM" (24h)
+  orden       Int      @default(0)
+  activo      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  centroId String
+  centro   Centro @relation(fields: [centroId], references: [id], onDelete: Restrict)
+
+  @@unique([centroId, nombre])
+  @@index([centroId, orden])
+}
+
+// -------------------------------------------------------------
+//  ASIGNACIONES HORARIAS  (núcleo del sistema)
+// -------------------------------------------------------------
+
+model Asignacion {
+  id            String    @id @default(cuid())
+  dia           String    // LUNES | MARTES | MIERCOLES | JUEVES | VIERNES | SABADO | DOMINGO
+  horaInicio    String    // "HH:MM" (24h)
+  horaFin       String    // "HH:MM" (24h)
+  vigenteDesde  DateTime?
+  vigenteHasta  DateTime?
+  observaciones String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  centroId String
+  centro   Centro @relation(fields: [centroId], references: [id], onDelete: Restrict)
+
+  profesorId String
+  profesor   Profesor @relation(fields: [profesorId], references: [id], onDelete: Restrict)
+
+  aulaId String
+  aula   Aula   @relation(fields: [aulaId], references: [id], onDelete: Restrict)
+
+  asignaturaId String
+  asignatura   Asignatura @relation(fields: [asignaturaId], references: [id], onDelete: Restrict)
+
+  grupoId String
+  grupo   Grupo  @relation(fields: [grupoId], references: [id], onDelete: Restrict)
+
+  // Trazabilidad: quién creó la asignación
+  createdById String?
+  createdBy   Usuario? @relation("AsignacionCreador", fields: [createdById], references: [id], onDelete: SetNull)
+
+  // Índices para las consultas más frecuentes (vistas por profesor / aula / grupo / semana)
+  @@index([centroId, dia])
+  @@index([centroId, profesorId, dia])
+  @@index([centroId, aulaId, dia])
+  @@index([centroId, grupoId, dia])
+}
